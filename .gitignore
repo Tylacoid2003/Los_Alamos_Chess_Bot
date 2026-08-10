@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Datasets
+data/datasets/
+*.h5
+*.npz
+
+# Trained models
+*.pth
+*.pt
+
+# Training checkpoints
+checkpoints/
+
+# Logs
+*.log
+reports/*.csv
+
+# Temporary images
+*.png
+*.jpg
+*.jpeg
+
+# Fairy-Stockfish executable
+fairy-stockfish

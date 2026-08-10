@@ -1,0 +1,1 @@
+# This folder stores the trained weights for both imitation learning and RL faces
