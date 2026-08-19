@@ -5,3 +5,17 @@ Epoch 29 | Current LR: 0.000050 --> Validation loss improved from 2.9629 to 2.92
 ======================================================= 
 TRAINING COMPLETE. LOADING BEST CHECKPOINT FOR FINAL TEST ======================================================= 
 FINAL BLIND TEST LOSS : 2.9190 (Pol: 2.4677, Val: 0.0226) FINAL BLIND TEST ACC : Top-1: 32.1%, Top-3: 56.8%, Top-5: 69.5%
+
+Depth 12
+=======================================================
+LOADING CHECKPOINT './models/Imitation_Learning_Model.pth' FOR FINAL TEST
+=======================================================
+FINAL BLIND TEST LOSS : 2.0269 (Pol: 1.7658, Val: 0.0131)
+FINAL BLIND TEST ACC  : Top-1: 43.3%, Top-3: 72.6%, Top-5: 84.9%
+
+Deth 14
+=======================================================
+LOADING CHECKPOINT './models/Imitation_Learning_Model2.pth' FOR FINAL TEST
+=======================================================
+FINAL BLIND TEST LOSS : 1.9727 (Pol: 1.7274, Val: 0.0123)
+FINAL BLIND TEST ACC  : Top-1: 44.2%, Top-3: 73.7%, Top-5: 85.7%

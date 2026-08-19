@@ -31,7 +31,12 @@ class PreTrainedAgent:
     """Your Dual-Head CNN AlphaZero Model (Raw Intuition)."""
     def __init__(self, model_path, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        
+        print(f"Running on device: {self.device}")
+                
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            torch.cuda.empty_cache()
+
         # Load Model Architecture
         self.model = CNN_Residual_Dual_Head_network().to(self.device)
         
@@ -160,11 +165,11 @@ class Arena:
 
 if __name__ == "__main__":
     # Ensure correct pathing from your project root
-    model_path = "./models/Imitation_Learning_Model.pth"
+    model_path = "./models/Imitation_Learning_Model2.pth"
     
     print("Loading MCTS Agent...")
     # Wrap the model in the MCTS Agent instead of the raw PreTrainedAgent
-    mcts_agent = MCTSAgent(model_path=model_path, num_simulations=50)
+    mcts_agent = PreTrainedAgent(model_path=model_path)
     
     print("Initializing Baseline...")
     random_agent = RandomAgent()
@@ -175,4 +180,4 @@ if __name__ == "__main__":
     final_stats = arena.evaluate(num_games=500)
     
     print("\n--- Final Results ---")
-    print(f"MCTS Model vs Random Agent Results: {final_stats}")
+    print(f"Pre-trained Model vs Random Agent Results: {final_stats}")

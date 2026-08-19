@@ -3,45 +3,50 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import h5py
+import gc
 from src.env.observation_encoder import encode_fen, build_action_space
 from src.models.cnn import CNN_Residual_Dual_Head_network, ResidualBlock
-from torch.utils.data import Dataset
-from torch.utils.data import random_split
-from torch.utils.data import DataLoader 
+from torch.utils.data import Dataset, random_split, DataLoader
 import matplotlib.pyplot as plt
 
 class LosAlamosDataset(Dataset):
     def __init__(self, h5_path):
         super().__init__()
-        with h5py.File(h5_path, "r") as h5file:
-            self.fens = [fen.decode('utf-8') for fen in h5file["fens"][:]]
-            self.moves = [move.decode('utf-8') for move in h5file["moves"][:]]
-            self.values = h5file["values"][:]
-            self.winners = h5file["winners"][:]
-
+        self.h5_path = h5_path
+        self.h5file = None  # We will open this lazily in __getitem__
         self.action_space = build_action_space()
-        self.policy_indices = [
-            self.action_space[m]
-            for m in self.moves
-        ]
+        
+        # Only read the length of the dataset to save RAM
+        with h5py.File(self.h5_path, "r") as h5file:
+            self.dataset_len = len(h5file["fens"])
 
     def __len__(self):
-        return len(self.fens)
+        return self.dataset_len
     
     def __getitem__(self, idx):
+        # Open the HDF5 file only once per worker process
+        if self.h5file is None:
+            self.h5file = h5py.File(self.h5_path, "r")
+
+        # 1. Read ONLY this specific index from the disk
+        fen = self.h5file["fens"][idx].decode('utf-8')
+        move = self.h5file["moves"][idx].decode('utf-8')
+        raw_stockfish = float(self.h5file["values"][idx])
+        game_outcome = float(self.h5file["winners"][idx])
+
+        # 2. Process State
         state_space_tensor = torch.from_numpy(
-            encode_fen(self.fens[idx])
+            encode_fen(fen)
         ).float()
 
+        # 3. Process Policy (Calculate index on the fly)
         policy_target_tensor = torch.tensor(
-            self.policy_indices[idx],
+            self.action_space[move],
             dtype=torch.long
         )
 
-        # Relaxed Normalization
-        raw_stockfish = float(self.values[idx])
-
-        turn_indicator = self.fens[idx].split()[1]   # 'w' or 'b'
+        # 4. Process Value
+        turn_indicator = fen.split()[1]   # 'w' or 'b'
 
         if turn_indicator == 'b':
             raw_stockfish = -raw_stockfish
@@ -49,9 +54,7 @@ class LosAlamosDataset(Dataset):
         normalized_stockfish = np.tanh(raw_stockfish / 600.0) 
         
         # Blending Stockfish Evaluation with True Game Outcome
-        game_outcome = float(self.winners[idx])
         alpha = 0.8
-
         blended_value = alpha * normalized_stockfish + (1 - alpha) * game_outcome
                 
         normalized_values_tensor = torch.tensor([blended_value], dtype=torch.float32)
@@ -67,7 +70,7 @@ def evaluate_model(model: nn.Module, dataloader: DataLoader, criterion_policy, c
     with torch.no_grad():
         for data in dataloader:
             state, pol_targ, val_targ = data
-            state, pol_targ, val_targ = state.to(device), pol_targ.to(device), val_targ.to(device)
+            state, pol_targ, val_targ = state.to(device, non_blocking=True), pol_targ.to(device, non_blocking=True), val_targ.to(device, non_blocking=True)
 
             pol_pred, val_pred = model(state)
 
@@ -104,14 +107,15 @@ def train_dual_head_network(
     model: nn.Module, 
     train_dataloader: DataLoader, 
     val_dataloader: DataLoader,     
-    test_dataloader: DataLoader,    
     criterion_policy: nn.Module, 
     criterion_value: nn.Module, 
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.ReduceLROnPlateau,
     num_epochs: int, 
     device: torch.device,
-    patience: int = 10           
+    checkpoint_path: str,
+    patience: int = 10,
+    grad_accumulation_steps: int = 1
 ) -> tuple[list[float], list[float], list[float], list[float], list[float], list[float], list[int]]:
     
     history_train_total, history_train_policy, history_train_value = [], [], []
@@ -120,7 +124,8 @@ def train_dual_head_network(
 
     best_val_loss = float('inf')
     epochs_without_improvement = 0
-    checkpoint_path = "./models/Imitation_Learning_Model.pth"
+
+    torch.backends.cudnn.benchmark = True
 
     for epoch in range(num_epochs):
         print(f"\n--- Starting Epoch {epoch+1}/{num_epochs} ---")
@@ -129,22 +134,27 @@ def train_dual_head_network(
         model.train()
         running_train_total, running_train_policy, running_train_value = 0.0, 0.0, 0.0
         running_train_top1, running_train_top3, running_train_top5 = 0, 0, 0
+        optimizer.zero_grad(set_to_none=True)
         
         for i, data in enumerate(train_dataloader):
             state_space, policy_target, value_target = data
-            state_space, policy_target, value_target = state_space.to(device), policy_target.to(device), value_target.to(device)
+            state_space, policy_target, value_target = state_space.to(device, non_blocking=True), policy_target.to(device, non_blocking=True), value_target.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
             policy_pred, value_pred = model(state_space)
 
             policy_loss = criterion_policy(policy_pred, policy_target)
             value_loss = criterion_value(value_pred, value_target)
             total_loss = policy_loss + (20.0 * value_loss)
 
+            total_loss = total_loss / grad_accumulation_steps
             total_loss.backward()
-            optimizer.step()
 
-            running_train_total += total_loss.item()
+            if (i + 1) % grad_accumulation_steps == 0 or (i + 1) == len(train_dataloader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            running_train_total += total_loss.item() * grad_accumulation_steps
             running_train_policy += policy_loss.item()
             running_train_value += value_loss.item()
             
@@ -205,29 +215,36 @@ def train_dual_head_network(
             epochs_without_improvement += 1
             print(f"--> No improvement in validation loss for {epochs_without_improvement} epoch(s).")
 
-        # --- EARLY STOPPING ---
         if epochs_without_improvement >= patience:
             print(f"\n[!] Early stopping triggered after {epoch+1} epochs.")
             break
             
-    # --- FINAL BLIND TEST EVALUATION ---
-    print("\n=======================================================")
-    print("TRAINING COMPLETE. LOADING BEST CHECKPOINT FOR FINAL TEST")
-    print("=======================================================")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    return (history_train_total, history_train_policy, history_train_value, 
+            history_val_total, history_val_policy, history_val_value, history_epochs)
 
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
+
+def test_saved_model(model: nn.Module, checkpoint_path: str, test_dataloader: DataLoader, criterion_policy, criterion_value, device: torch.device):
+    """Standalone function to load weights and test the model."""
+    print("\n=======================================================")
+    print(f"LOADING CHECKPOINT '{checkpoint_path}' FOR FINAL TEST")
+    print("=======================================================")
     
+    # Load weights
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model"])
+    
+    # Explicit garbage collection to free up memory before testing
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     test_total, test_pol, test_val, test_top1, test_top3, test_top5 = evaluate_model(
         model, test_dataloader, criterion_policy, criterion_value, device
     )
     
     print(f"FINAL BLIND TEST LOSS : {test_total:.4f} (Pol: {test_pol:.4f}, Val: {test_val:.4f})")
     print(f"FINAL BLIND TEST ACC  : Top-1: {test_top1:.1f}%, Top-3: {test_top3:.1f}%, Top-5: {test_top5:.1f}%")
-        
-    return (history_train_total, history_train_policy, history_train_value, 
-            history_val_total, history_val_policy, history_val_value, history_epochs)
+
 
 def plot_train_and_val(
     history_train_total: list[float], history_train_policy: list[float], history_train_value: list[float],
@@ -258,14 +275,23 @@ def plot_train_and_val(
     plt.tight_layout()
     plt.show()
 
+
 if __name__ == "__main__":
+    
+    # ==========================================
+    # TOGGLE THIS TO FALSE TO SKIP TRAINING
+    # ==========================================
+    RUN_TRAINING = True 
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Training on device: {device}")
+    print(f"Running on device: {device}")
+    
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        torch.cuda.empty_cache()
 
-    dataset = LosAlamosDataset("./data/datasets/los_alamos_dataset.h5")
+    dataset = LosAlamosDataset("./data/datasets/los_alamos_dataset2.h5")
     dataset_length = len(dataset)
-
-    # generate seed for reproductibility
     generator = torch.Generator().manual_seed(42)
 
     training_len = int(0.8 * dataset_length)
@@ -276,37 +302,71 @@ if __name__ == "__main__":
         dataset, [training_len, val_len, test_len], generator=generator
     )
 
-    train_dataloader = DataLoader(train_dataset, batch_size=256, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=256, shuffle=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+    BATCH_SIZE = 512
+    NUM_WORKERS = 4
+    PIN_MEMORY = True
+    CHECKPOINT_PATH = "./models/Imitation_Learning_Model2.pth"
 
     cnn = CNN_Residual_Dual_Head_network(num_residual_blocks=6, out_channel_conv=64).to(device)
-
     criterion_policy = nn.CrossEntropyLoss()
     criterion_value = nn.SmoothL1Loss() 
+
+    if RUN_TRAINING:
+        print("Initializing Training DataLoaders...")
+        train_dataloader = DataLoader(
+            train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+            prefetch_factor=2, persistent_workers=True
+        )
+        val_dataloader = DataLoader(
+            val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=True
+        )
+
+        optimizer = optim.Adam(cnn.parameters(), lr=2e-4, weight_decay=1e-4) 
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+        num_epochs = 120
+        early_stopping_patience = 12
+        GRAD_ACCUMULATION_STEPS = 1 
+
+        history = train_dual_head_network(
+            model=cnn, 
+            train_dataloader=train_dataloader, 
+            val_dataloader=val_dataloader, 
+            criterion_policy=criterion_policy, 
+            criterion_value=criterion_value, 
+            optimizer=optimizer,
+            scheduler=scheduler,
+            num_epochs=num_epochs, 
+            device=device,
+            checkpoint_path=CHECKPOINT_PATH,
+            patience=early_stopping_patience,
+            grad_accumulation_steps=GRAD_ACCUMULATION_STEPS
+        )
+        plot_train_and_val(*history)
+        
+        # Manually clear memory after training finishes before testing
+        del train_dataloader, val_dataloader, optimizer
+        gc.collect()
+
+    # --- TESTING BLOCK ---
+    print("Initializing Test DataLoader...")
     
-    optimizer = optim.Adam(cnn.parameters(), lr=1e-4, weight_decay=1e-4) # L2 regularization implemented
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3) # addaptive lr
+    # We use num_workers=0 and a smaller batch size to avoid OpenBLAS/Memory errors during evaluation
+    test_dataloader = DataLoader(
+        test_dataset, 
+        batch_size=256, 
+        shuffle=False,
+        num_workers=0,  
+        pin_memory=True
+    )
 
-    num_epochs = 120
-    early_stopping_patience = 12 # Stop if validation fails to improve for 12 epochs
-
-    history_train_total, history_train_policy, history_train_value, history_val_total, history_val_policy, history_val_value, history_epochs = train_dual_head_network(
+    test_saved_model(
         model=cnn, 
-        train_dataloader=train_dataloader, 
-        val_dataloader=val_dataloader, 
+        checkpoint_path=CHECKPOINT_PATH, 
         test_dataloader=test_dataloader, 
         criterion_policy=criterion_policy, 
         criterion_value=criterion_value, 
-        optimizer=optimizer,
-        scheduler=scheduler,
-        num_epochs=num_epochs, 
-        device=device,
-        patience=early_stopping_patience
-    )
-
-    plot_train_and_val(
-        history_train_total, history_train_policy, history_train_value, 
-        history_val_total, history_val_policy, history_val_value, 
-        history_epochs
+        device=device
     )
